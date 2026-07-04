@@ -1,0 +1,18 @@
+{
+	"name": "pi-extensions",
+	"version": "1.0.0",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Qusic/pi-extensions.git"
+	},
+	"pi": {
+		"extensions": ["./*.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
