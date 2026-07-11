@@ -1,20 +1,17 @@
-// Sync GitHub Copilot context/output limits into models.json from your tenant's
-// live CAPI /models. Run /copilot-sync anytime to refresh.
-//
-// Everything comes from pi at runtime, nothing hardcoded: getModels() is the real
-// built-in catalog, getApiKeyAndHeaders() gives the fresh token + client headers,
-// a built-in model's baseUrl is already rewritten to your tenant host, and
-// modelRegistry.refresh() re-reads models.json so changes apply without a restart.
-//
-// Writes providers["github-copilot"].modelOverrides (contextWindow/maxTokens/
-// thinkingLevelMap for models pi knows) and .models (entries for tenant models it
-// doesn't). Other providers and top-level keys are preserved.
+// Sync tenant-specific GitHub Copilot capabilities from live CAPI /models.
+// Existing pi models get additive-only overrides: larger context/output limits and
+// missing xhigh/max tiers. Unknown tenant models are added in full. Re-run after a pi
+// upgrade so models newly built into pi move automatically from .models to overrides.
+// Other providers and top-level models.json keys are preserved.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getModels } from "@earendil-works/pi-ai";
+// pi's extension loader exposes pi-ai through compat; providers/all is not resolvable there.
+import { getModels } from "@earendil-works/pi-ai/compat";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// Schema and constants
 
 const PROVIDER = "github-copilot";
 
@@ -24,9 +21,11 @@ interface LiveModel {
   vendor?: string;
   model_picker_enabled?: boolean;
   supported_endpoints?: string[];
+  policy?: { state?: string };
   capabilities?: {
     type?: string;
     supports?: {
+      tool_calls?: boolean;
       vision?: boolean;
       thinking?: boolean;
       adaptive_thinking?: boolean;
@@ -39,10 +38,10 @@ interface LiveModel {
 }
 
 type ThinkingMap = Record<string, string | null>;
-type Override = { contextWindow?: number; maxTokens?: number; thinkingLevelMap?: ThinkingMap };
-type Builtin = { id: string; api: string };
+type ModelOverride = { contextWindow?: number; maxTokens?: number; thinkingLevelMap?: ThinkingMap };
+type BuiltinModel = { id: string; api: string; contextWindow: number; maxTokens: number; thinkingLevelMap?: ThinkingMap };
 
-interface ModelInsert {
+interface CustomModel {
   id: string;
   name: string;
   api: string;
@@ -56,146 +55,177 @@ interface ModelInsert {
   thinkingLevelMap?: ThinkingMap;
 }
 
-// github-copilot serves exactly these three APIs; a model's declared endpoints map
-// to them (native endpoints preferred over the generic /chat/completions).
-const ENDPOINT_API: Record<string, string> = {
-  "/v1/messages": "anthropic-messages",
-  "/responses": "openai-responses",
-  "/chat/completions": "openai-completions",
-};
-// Which APIs send a thinking effort on Copilot; /chat/completions rejects it (we
-// force supportsReasoningEffort:false and skip the thinking map there).
-const usesEffort = (api: string) => api === "anthropic-messages" || api === "openai-responses";
+interface SyncPlan {
+  overrides: Record<string, ModelOverride>;
+  customModels: CustomModel[];
+}
 
-const RANK: Record<string, number> = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 5 };
-const PI_LEVELS = ["minimal", "low", "medium", "high", "xhigh"];
+// Native endpoints first; generic Chat Completions last.
+const ENDPOINTS = [
+  ["/v1/messages", "anthropic-messages"],
+  ["/responses", "openai-responses"],
+  ["/chat/completions", "openai-completions"],
+] as const;
+const TIERS = ["low", "medium", "high", "xhigh", "max"] as const;
+const OPTIONAL_TIERS = ["xhigh", "max"] as const;
+
+// Live metadata interpretation
 
 const family = (id: string) => id.split(/[-.]/).slice(0, 2).join("-");
 
-function agentDir(): string {
-  const d = process.env.PI_CODING_AGENT_DIR;
-  return d ? d.replace(/^~(\/|$)/, `${homedir()}$1`) : join(homedir(), ".pi", "agent");
-}
-
-// api for a tenant model pi doesn't know: prefer a native endpoint over the generic
-// /chat/completions, else fall back to a same-family built-in or the vendor.
-function resolveApi(m: LiveModel, builtins: readonly Builtin[]): string {
-  const eps = m.supported_endpoints ?? [];
-  for (const api of ["anthropic-messages", "openai-responses", "openai-completions"]) {
-    if (eps.some((e) => ENDPOINT_API[e] === api)) return api;
+function resolveApi(model: LiveModel, builtins: readonly BuiltinModel[]): string {
+  const endpoints = new Set(model.supported_endpoints);
+  for (const [endpoint, api] of ENDPOINTS) {
+    if (endpoints.has(endpoint)) return api;
   }
-  const sib = builtins.find((b) => family(b.id) === family(m.id));
-  if (sib) return sib.api;
-  const v = (m.vendor ?? "").toLowerCase();
-  return v.includes("anthropic") ? "anthropic-messages" : v.includes("openai") ? "openai-responses" : "openai-completions";
+  const sibling = builtins.find((item) => family(item.id) === family(model.id));
+  if (sibling) return sibling.api;
+  const vendor = model.vendor?.toLowerCase() ?? "";
+  if (vendor.includes("anthropic")) return "anthropic-messages";
+  if (vendor.includes("openai")) return "openai-responses";
+  return "openai-completions";
 }
 
-function contextWindowOf(cap: LiveModel["capabilities"]): number | undefined {
-  const lim = cap?.limits;
-  return lim?.max_context_window_tokens ?? ((lim?.max_prompt_tokens ?? 0) + (lim?.max_output_tokens ?? 0) || undefined);
+function contextWindowOf(capabilities: LiveModel["capabilities"]): number | undefined {
+  const limits = capabilities?.limits;
+  if (limits?.max_context_window_tokens !== undefined) return limits.max_context_window_tokens;
+  if (limits?.max_prompt_tokens !== undefined && limits.max_output_tokens !== undefined) {
+    return limits.max_prompt_tokens + limits.max_output_tokens;
+  }
+  return undefined;
 }
 
-// Copilot advertises reasoning two ways: effort levels (reasoning_effort/
-// adaptive_thinking) on newer models, or a token budget (max/min_thinking_budget)
-// on older ones -- check both or budget-style models look non-reasoning.
-function isReasoning(m: LiveModel): boolean {
-  const s = m.capabilities?.supports;
-  return Boolean(s?.reasoning_effort?.length || s?.adaptive_thinking || s?.thinking || s?.max_thinking_budget || s?.min_thinking_budget);
+function isReasoning(model: LiveModel): boolean {
+  const supports = model.capabilities?.supports;
+  return Boolean(
+    supports?.reasoning_effort?.length ||
+      supports?.adaptive_thinking ||
+      supports?.thinking ||
+      supports?.max_thinking_budget ||
+      supports?.min_thinking_budget,
+  );
 }
 
-// thinkingLevelMap for a model+api, or undefined if the api sends no effort or the
-// model advertises none. Aligns pi's fixed levels to the model's reasoning_effort by
-// count, anchored at the bottom (minimal -> lowest) so the top usable level reaches
-// the model's highest effort (incl. "max"); extra top levels are hidden with null.
-// off follows the API: allowed only if it lists a none/off effort, else disabled.
-function thinkingMap(m: LiveModel, api: string): ThinkingMap | undefined {
-  if (!usesEffort(api)) return undefined;
-  const effort = m.capabilities?.supports?.reasoning_effort;
-  const noneToken = effort?.find((e) => e === "none" || e === "off");
-  let ladder = (effort ?? []).filter((e) => e !== "none" && e !== "off").sort((a, b) => (RANK[a] ?? 99) - (RANK[b] ?? 99));
-  if (!ladder.length) return undefined;
-  if (ladder.length > 5) ladder = ladder.slice(-5); // keep the top 5 so "max" stays reachable
+function reasoningEfforts(model: LiveModel, api: string): Set<string> | undefined {
+  if (api === "openai-completions") return undefined;
+  const efforts = model.capabilities?.supports?.reasoning_effort;
+  return efforts?.length ? new Set(efforts) : undefined;
+}
+
+// Existing models only need explicit opt-in for pi's optional top tiers.
+function deriveOverrideThinkingMap(model: LiveModel, api: string, builtinMap?: ThinkingMap): ThinkingMap | undefined {
+  const offered = reasoningEfforts(model, api);
+  if (!offered) return undefined;
+  const additions: ThinkingMap = {};
+  for (const level of OPTIONAL_TIERS) {
+    if (offered.has(level) && typeof builtinMap?.[level] !== "string") additions[level] = level;
+  }
+  return Object.keys(additions).length ? additions : undefined;
+}
+
+// Unknown models need a complete map because they have no built-in defaults.
+function deriveCustomThinkingMap(model: LiveModel, api: string): ThinkingMap | undefined {
+  const offered = reasoningEfforts(model, api);
+  if (!offered) return undefined;
   const map: ThinkingMap = {};
-  PI_LEVELS.forEach((lvl, i) => (map[lvl] = i < ladder.length ? ladder[i] : null));
-  map.off = noneToken ?? null; // non-null re-enables off (overriding a built-in off:null)
+  if (api === "openai-responses") map.off = offered.has("none") ? "none" : offered.has("off") ? "off" : null;
+  map.minimal = offered.has("minimal") ? "minimal" : (TIERS.find((level) => offered.has(level)) ?? null);
+  for (const level of TIERS) map[level] = offered.has(level) ? level : null;
   return map;
 }
 
-// Override for a model pi already knows: only the fields the live API can supply
-// reliably (context/output limits + thinking ladder). reasoning/input/compat/cost
-// are left to pi's curated built-in.
-function buildOverride(m: LiveModel, api: string): Override | undefined {
-  const e: Override = {};
-  const cw = contextWindowOf(m.capabilities);
-  const out = m.capabilities?.limits?.max_output_tokens;
-  if (Number.isFinite(cw)) e.contextWindow = cw;
-  if (Number.isFinite(out)) e.maxTokens = out;
-  const tlm = thinkingMap(m, api);
-  if (tlm) e.thinkingLevelMap = tlm;
-  return Object.keys(e).length ? e : undefined;
+// Sync plan construction
+
+function buildModelOverride(model: LiveModel, builtin: BuiltinModel): ModelOverride | undefined {
+  const override: ModelOverride = {};
+  const contextWindow = contextWindowOf(model.capabilities);
+  const maxTokens = model.capabilities?.limits?.max_output_tokens;
+  if (contextWindow !== undefined && contextWindow > builtin.contextWindow) override.contextWindow = contextWindow;
+  if (maxTokens !== undefined && maxTokens > builtin.maxTokens) override.maxTokens = maxTokens;
+  const thinkingLevelMap = deriveOverrideThinkingMap(model, builtin.api, builtin.thinkingLevelMap);
+  if (thinkingLevelMap) override.thinkingLevelMap = thinkingLevelMap;
+  return Object.keys(override).length ? override : undefined;
 }
 
-function buildInsert(m: LiveModel, api: string, base: string, clientHeaders?: Record<string, string>): ModelInsert {
-  const supports = m.capabilities?.supports;
-  const insert: ModelInsert = {
-    id: m.id,
-    name: m.name ?? m.id,
+function buildCustomModel(model: LiveModel, api: string, baseUrl: string, headers?: Record<string, string>): CustomModel {
+  const supports = model.capabilities?.supports;
+  const customModel: CustomModel = {
+    id: model.id,
+    name: model.name ?? model.id,
     api,
-    baseUrl: base,
-    reasoning: isReasoning(m),
+    baseUrl,
+    reasoning: isReasoning(model),
     input: supports?.vision ? ["text", "image"] : ["text"],
-    contextWindow: contextWindowOf(m.capabilities) ?? 128000,
-    maxTokens: m.capabilities?.limits?.max_output_tokens ?? 4096,
-    // Static Copilot client headers (User-Agent/Editor-*/Copilot-Integration-Id)
-    // aren't inherited by custom models, so copy them or requests get rejected.
-    headers: clientHeaders,
+    contextWindow: contextWindowOf(model.capabilities) ?? 128000,
+    maxTokens: model.capabilities?.limits?.max_output_tokens ?? 4096,
+    headers, // custom models do not inherit Copilot's required client headers
   };
-  // pi auto-detects openai compat from baseUrl but doesn't know Copilot's host, so it
-  // would wrongly default these to true; Copilot's /chat/completions rejects them
-  // (built-ins hardcode all three false). Anthropic adaptive-thinking models need the
-  // adaptive request format.
   if (api === "openai-completions") {
-    insert.compat = { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false };
+    // Copilot rejects these OpenAI-compatible extensions.
+    customModel.compat = { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false };
   } else if (api === "anthropic-messages" && supports?.adaptive_thinking) {
-    insert.compat = { forceAdaptiveThinking: true };
+    customModel.compat = { forceAdaptiveThinking: true };
   }
-  const tlm = thinkingMap(m, api);
-  if (tlm) insert.thinkingLevelMap = tlm;
-  return insert;
+  const thinkingLevelMap = deriveCustomThinkingMap(model, api);
+  if (thinkingLevelMap) customModel.thinkingLevelMap = thinkingLevelMap;
+  return customModel;
 }
 
-function collectModels(live: LiveModel[], builtins: readonly Builtin[], base: string, clientHeaders?: Record<string, string>) {
-  const builtinById = new Map(builtins.map((b) => [b.id, b]));
-  const chat = live
-    .filter((m) => m.capabilities?.type === "chat" && m.model_picker_enabled !== false)
-    .sort((a, b) => a.id.localeCompare(b.id));
+function isSelectableChat(model: LiveModel): boolean {
+  return (
+    model.capabilities?.type === "chat" &&
+    model.model_picker_enabled === true &&
+    model.policy?.state !== "disabled" &&
+    model.capabilities.supports?.tool_calls !== false
+  );
+}
 
-  const overrides: Record<string, Override> = {};
-  const inserts: ModelInsert[] = [];
-  for (const m of chat) {
-    const builtin = builtinById.get(m.id);
+function buildSyncPlan(
+  live: LiveModel[],
+  builtins: readonly BuiltinModel[],
+  baseUrl: string,
+  headers?: Record<string, string>,
+): SyncPlan {
+  const builtinById = new Map(builtins.map((model) => [model.id, model]));
+  const chat = live.filter(isSelectableChat).sort((a, b) => a.id.localeCompare(b.id));
+  const plan: SyncPlan = { overrides: {}, customModels: [] };
+
+  for (const model of chat) {
+    const builtin = builtinById.get(model.id);
     if (builtin) {
-      const e = buildOverride(m, builtin.api);
-      if (e) overrides[m.id] = e;
+      const override = buildModelOverride(model, builtin);
+      if (override) plan.overrides[model.id] = override;
     } else {
-      inserts.push(buildInsert(m, resolveApi(m, builtins), base, clientHeaders));
+      plan.customModels.push(buildCustomModel(model, resolveApi(model, builtins), baseUrl, headers));
     }
   }
-  return { overrides, inserts };
+  return plan;
 }
 
-async function fetchLiveModels(base: string, headers: Record<string, string>, signal?: AbortSignal): Promise<LiveModel[]> {
-  const res = await fetch(`${base}/models`, { headers, signal });
-  if (!res.ok) {
-    if (res.status === 401) throw new Error("Copilot token expired — send a message or /login, then retry.");
-    throw new Error(`Copilot /models failed (${res.status}).`);
+// I/O
+
+function agentDir(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  return configured ? configured.replace(/^~(\/|$)/, `${homedir()}$1`) : join(homedir(), ".pi", "agent");
+}
+
+async function fetchLiveModels(
+  baseUrl: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<LiveModel[]> {
+  const response = await fetch(`${baseUrl}/models`, { headers, signal });
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Copilot token expired — send a message or /login, then retry.");
+    throw new Error(`Copilot /models failed (${response.status}).`);
   }
-  return ((await res.json()) as { data: LiveModel[] }).data;
+  const data = (await response.json()) as { data?: unknown };
+  if (!Array.isArray(data.data)) throw new Error("Copilot /models returned an invalid response.");
+  return data.data as LiveModel[];
 }
 
-// Merge into models.json, replacing only github-copilot's modelOverrides/models and
-// preserving other providers and top-level keys.
-function writeConfig(outFile: string, overrides: Record<string, Override>, inserts: ModelInsert[]): void {
+// Replace only github-copilot's generated entries; preserve every other config key.
+function writeConfig(outFile: string, { overrides, customModels }: SyncPlan): void {
   let cfg: { providers?: Record<string, Record<string, unknown>> } = {};
   if (existsSync(outFile)) {
     try {
@@ -205,39 +235,46 @@ function writeConfig(outFile: string, overrides: Record<string, Override>, inser
     }
   }
   cfg.providers ??= {};
-  const prov = cfg.providers[PROVIDER] ?? {};
-  prov.modelOverrides = overrides;
-  if (inserts.length) prov.models = inserts;
-  else delete prov.models;
-  cfg.providers[PROVIDER] = prov;
+  const provider = cfg.providers[PROVIDER] ?? {};
+  if (Object.keys(overrides).length) provider.modelOverrides = overrides;
+  else delete provider.modelOverrides;
+  if (customModels.length) provider.models = customModels;
+  else delete provider.models;
+  if (Object.keys(provider).length) cfg.providers[PROVIDER] = provider;
+  else delete cfg.providers[PROVIDER];
   writeFileSync(outFile, JSON.stringify(cfg, null, 2) + "\n");
 }
 
+// Extension entrypoint
+
 export default function (pi: ExtensionAPI): void {
   pi.registerCommand("copilot-sync", {
-    description: "Sync GitHub Copilot context/output limits into models.json from your tenant's live /models",
+    description: "Sync additive GitHub Copilot model capabilities from live /models",
     handler: async (_args, ctx) => {
       const builtins = getModels(PROVIDER);
       const builtinIds = new Set(builtins.map((m) => m.id));
 
-      // A loaded built-in model carries pi's tenant-rewritten baseUrl + Copilot
-      // client headers; getApiKeyAndHeaders then yields the fresh token.
-      const probe = ctx.modelRegistry.getAll().find((m) => m.provider === PROVIDER && builtinIds.has(m.id));
-      const auth = probe && (await ctx.modelRegistry.getApiKeyAndHeaders(probe));
-      if (!probe || !auth?.ok || !auth.apiKey) {
-        ctx.ui.notify("Not logged in to GitHub Copilot — run /login github-copilot first.", "error");
+      // A loaded model carries the tenant base URL and required Copilot client headers.
+      const probe = ctx.modelRegistry.getAll().find((model) => model.provider === PROVIDER && builtinIds.has(model.id));
+      if (!probe) {
+        ctx.ui.notify("GitHub Copilot models are unavailable — run /login github-copilot first.", "error");
         return;
       }
 
       try {
-        const authHeaders = { ...auth.headers, Authorization: `Bearer ${auth.apiKey}`, Accept: "application/json" };
-        const live = await fetchLiveModels(probe.baseUrl, authHeaders, ctx.signal);
-        const { overrides, inserts } = collectModels(live, builtins, probe.baseUrl, probe.headers);
-        writeConfig(join(agentDir(), "models.json"), overrides, inserts);
-        ctx.modelRegistry.refresh(); // re-reads models.json, applies now
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(probe);
+        if (!auth.ok || !auth.apiKey) {
+          ctx.ui.notify("Not logged in to GitHub Copilot — run /login github-copilot first.", "error");
+          return;
+        }
+        const headers = { ...auth.headers, Authorization: `Bearer ${auth.apiKey}`, Accept: "application/json" };
+        const live = await fetchLiveModels(probe.baseUrl, headers, ctx.signal);
+        const plan = buildSyncPlan(live, builtins, probe.baseUrl, probe.headers);
+        writeConfig(join(agentDir(), "models.json"), plan);
+        ctx.modelRegistry.refresh();
 
-        let msg = `Copilot synced: ${Object.keys(overrides).length} updated, ${inserts.length} added.`;
-        if (inserts.length) msg += `\nAdded: ${inserts.map((i) => i.id).join(", ")}`;
+        let msg = `Copilot synced: ${Object.keys(plan.overrides).length} updated, ${plan.customModels.length} added.`;
+        if (plan.customModels.length) msg += `\nAdded: ${plan.customModels.map((model) => model.id).join(", ")}`;
         ctx.ui.notify(msg, "info");
       } catch (e) {
         ctx.ui.notify((e as Error).message, "error");
