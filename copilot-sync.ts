@@ -14,6 +14,8 @@ import { join } from "node:path";
 // Schema and constants
 
 const PROVIDER = "github-copilot";
+// Mirrors pi-ai's Copilot /models request.
+const COPILOT_API_VERSION = "2026-06-01";
 
 interface LiveModel {
   id: string;
@@ -204,6 +206,12 @@ function buildSyncPlan(
 
 // I/O
 
+// OAuth baseUrl is request-scoped in current pi; the token carries the tenant endpoint.
+function copilotBaseUrlFromToken(accessToken: string): string | undefined {
+  const proxyHost = accessToken.match(/proxy-ep=([^;]+)/)?.[1];
+  return proxyHost ? `https://${proxyHost.replace(/^proxy\./, "api.")}` : undefined;
+}
+
 function agentDir(): string {
   const configured = process.env.PI_CODING_AGENT_DIR;
   return configured ? configured.replace(/^~(\/|$)/, `${homedir()}$1`) : join(homedir(), ".pi", "agent");
@@ -254,7 +262,7 @@ export default function (pi: ExtensionAPI): void {
       const builtins = getModels(PROVIDER);
       const builtinIds = new Set(builtins.map((m) => m.id));
 
-      // A loaded model carries the tenant base URL and required Copilot client headers.
+      // Reuse a built-in model's required Copilot client headers.
       const probe = ctx.modelRegistry.getAll().find((model) => model.provider === PROVIDER && builtinIds.has(model.id));
       if (!probe) {
         ctx.ui.notify("GitHub Copilot models are unavailable — run /login github-copilot first.", "error");
@@ -267,11 +275,17 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify("Not logged in to GitHub Copilot — run /login github-copilot first.", "error");
           return;
         }
-        const headers = { ...auth.headers, Authorization: `Bearer ${auth.apiKey}`, Accept: "application/json" };
-        const live = await fetchLiveModels(probe.baseUrl, headers, ctx.signal);
-        const plan = buildSyncPlan(live, builtins, probe.baseUrl, probe.headers);
+        const baseUrl = copilotBaseUrlFromToken(auth.apiKey) ?? probe.baseUrl;
+        const headers = {
+          ...auth.headers,
+          Authorization: `Bearer ${auth.apiKey}`,
+          Accept: "application/json",
+          "X-GitHub-Api-Version": COPILOT_API_VERSION,
+        };
+        const live = await fetchLiveModels(baseUrl, headers, ctx.signal);
+        const plan = buildSyncPlan(live, builtins, baseUrl, probe.headers);
         writeConfig(join(agentDir(), "models.json"), plan);
-        ctx.modelRegistry.refresh();
+        await ctx.modelRegistry.refresh();
 
         let msg = `Copilot synced: ${Object.keys(plan.overrides).length} updated, ${plan.customModels.length} added.`;
         if (plan.customModels.length) msg += `\nAdded: ${plan.customModels.map((model) => model.id).join(", ")}`;
