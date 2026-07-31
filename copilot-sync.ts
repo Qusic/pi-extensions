@@ -2,6 +2,9 @@
 // Existing pi models get additive-only overrides: larger context/output limits and
 // missing xhigh/max tiers. Unknown tenant models are added in full. Re-run after a pi
 // upgrade so models newly built into pi move automatically from .models to overrides.
+// The tenant endpoint and client headers are pinned on the provider so custom models
+// inherit them. The baseUrl pin also works around compaction reading the catalog
+// baseUrl instead of the per-request one (earendil-works/pi#6768 — remove it once fixed).
 // Other providers and top-level models.json keys are preserved.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -47,17 +50,18 @@ interface CustomModel {
   id: string;
   name: string;
   api: string;
-  baseUrl: string;
   reasoning: boolean;
   input: ("text" | "image")[];
   contextWindow: number;
   maxTokens: number;
-  headers?: Record<string, string>;
   compat?: Record<string, boolean>;
   thinkingLevelMap?: ThinkingMap;
 }
 
-interface SyncPlan {
+// Endpoint and client headers shared by every model of the provider.
+type ProviderPin = { baseUrl: string; headers?: Record<string, string> };
+
+interface SyncPlan extends ProviderPin {
   overrides: Record<string, ModelOverride>;
   customModels: CustomModel[];
 }
@@ -149,18 +153,16 @@ function buildModelOverride(model: LiveModel, builtin: BuiltinModel): ModelOverr
   return Object.keys(override).length ? override : undefined;
 }
 
-function buildCustomModel(model: LiveModel, api: string, baseUrl: string, headers?: Record<string, string>): CustomModel {
+function buildCustomModel(model: LiveModel, api: string): CustomModel {
   const supports = model.capabilities?.supports;
   const customModel: CustomModel = {
     id: model.id,
     name: model.name ?? model.id,
     api,
-    baseUrl,
     reasoning: isReasoning(model),
     input: supports?.vision ? ["text", "image"] : ["text"],
     contextWindow: contextWindowOf(model.capabilities) ?? 128000,
     maxTokens: model.capabilities?.limits?.max_output_tokens ?? 4096,
-    headers, // custom models do not inherit Copilot's required client headers
   };
   if (api === "openai-completions") {
     // Copilot rejects these OpenAI-compatible extensions.
@@ -182,15 +184,10 @@ function isSelectableChat(model: LiveModel): boolean {
   );
 }
 
-function buildSyncPlan(
-  live: LiveModel[],
-  builtins: readonly BuiltinModel[],
-  baseUrl: string,
-  headers?: Record<string, string>,
-): SyncPlan {
+function buildSyncPlan(live: LiveModel[], builtins: readonly BuiltinModel[], pin: ProviderPin): SyncPlan {
   const builtinById = new Map(builtins.map((model) => [model.id, model]));
   const chat = live.filter(isSelectableChat).sort((a, b) => a.id.localeCompare(b.id));
-  const plan: SyncPlan = { overrides: {}, customModels: [] };
+  const plan: SyncPlan = { ...pin, overrides: {}, customModels: [] };
 
   for (const model of chat) {
     const builtin = builtinById.get(model.id);
@@ -198,7 +195,7 @@ function buildSyncPlan(
       const override = buildModelOverride(model, builtin);
       if (override) plan.overrides[model.id] = override;
     } else {
-      plan.customModels.push(buildCustomModel(model, resolveApi(model, builtins), baseUrl, headers));
+      plan.customModels.push(buildCustomModel(model, resolveApi(model, builtins)));
     }
   }
   return plan;
@@ -206,7 +203,7 @@ function buildSyncPlan(
 
 // I/O
 
-// OAuth baseUrl is request-scoped in current pi; the token carries the tenant endpoint.
+// Copilot tokens carry the tenant endpoint as proxy-ep=proxy.<plan>.githubcopilot.com.
 function copilotBaseUrlFromToken(accessToken: string): string | undefined {
   const proxyHost = accessToken.match(/proxy-ep=([^;]+)/)?.[1];
   return proxyHost ? `https://${proxyHost.replace(/^proxy\./, "api.")}` : undefined;
@@ -232,9 +229,9 @@ async function fetchLiveModels(
   return data.data as LiveModel[];
 }
 
-// Replace only github-copilot's generated entries; preserve every other config key.
-function writeConfig(outFile: string, { overrides, customModels }: SyncPlan): void {
-  let cfg: { providers?: Record<string, Record<string, unknown>> } = {};
+// Regenerate github-copilot's block from scratch; other providers and top-level keys survive.
+function writeConfig(outFile: string, { baseUrl, headers, overrides, customModels }: SyncPlan): void {
+  let cfg: { providers?: Record<string, unknown> } = {};
   if (existsSync(outFile)) {
     try {
       cfg = JSON.parse(readFileSync(outFile, "utf8").replace(/^\uFEFF/, ""));
@@ -242,14 +239,10 @@ function writeConfig(outFile: string, { overrides, customModels }: SyncPlan): vo
       throw new Error("models.json is invalid JSON — aborting to avoid overwriting it.");
     }
   }
-  cfg.providers ??= {};
-  const provider = cfg.providers[PROVIDER] ?? {};
+  const provider: Record<string, unknown> = { baseUrl, headers };
   if (Object.keys(overrides).length) provider.modelOverrides = overrides;
-  else delete provider.modelOverrides;
   if (customModels.length) provider.models = customModels;
-  else delete provider.models;
-  if (Object.keys(provider).length) cfg.providers[PROVIDER] = provider;
-  else delete cfg.providers[PROVIDER];
+  cfg.providers = { ...cfg.providers, [PROVIDER]: provider };
   writeFileSync(outFile, JSON.stringify(cfg, null, 2) + "\n");
 }
 
@@ -262,7 +255,7 @@ export default function (pi: ExtensionAPI): void {
       const builtins = getModels(PROVIDER);
       const builtinIds = new Set(builtins.map((m) => m.id));
 
-      // Reuse a built-in model's required Copilot client headers.
+      // Reuse a built-in model's Copilot client headers and its last-known endpoint.
       const probe = ctx.modelRegistry.getAll().find((model) => model.provider === PROVIDER && builtinIds.has(model.id));
       if (!probe) {
         ctx.ui.notify("GitHub Copilot models are unavailable — run /login github-copilot first.", "error");
@@ -275,15 +268,16 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify("Not logged in to GitHub Copilot — run /login github-copilot first.", "error");
           return;
         }
+        // The pinned baseUrl feeds back into probe.baseUrl, so the last good value survives.
         const baseUrl = copilotBaseUrlFromToken(auth.apiKey) ?? probe.baseUrl;
-        const headers = {
+        const requestHeaders = {
           ...auth.headers,
           Authorization: `Bearer ${auth.apiKey}`,
           Accept: "application/json",
           "X-GitHub-Api-Version": COPILOT_API_VERSION,
         };
-        const live = await fetchLiveModels(baseUrl, headers, ctx.signal);
-        const plan = buildSyncPlan(live, builtins, baseUrl, probe.headers);
+        const live = await fetchLiveModels(baseUrl, requestHeaders, ctx.signal);
+        const plan = buildSyncPlan(live, builtins, { baseUrl, headers: probe.headers });
         writeConfig(join(agentDir(), "models.json"), plan);
         await ctx.modelRegistry.refresh();
 
