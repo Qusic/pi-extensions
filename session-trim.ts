@@ -6,7 +6,7 @@
 // is refused unless the projected context, the resolved model/thinking level, the
 // session name, and the surviving labels are provably unchanged.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createReadStream, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, openSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 // Schema
@@ -23,7 +23,6 @@ interface Meta {
   id: string;
   parentId: string | null;
   type: string;
-  timestamp?: string;
   firstKeptEntryId?: string; // compaction
   targetId?: string; // label
   label?: string; // label
@@ -33,8 +32,9 @@ interface Meta {
 }
 
 interface TrimPlan {
-  chain: Meta[]; // surviving entries, in file order
-  labels: Meta[]; // effective labels whose own entry was dropped, re-emitted at the tail
+  chain: Meta[]; // survivors in file order: rescued branch state, then the kept range
+  tail: Meta[]; // file-scoped state winners, re-emitted last so they still win
+  total: number; // entries the file held when the plan was made
   kept: number; // entries the rewritten file will hold
   bytes: number; // estimated size of those entries
 }
@@ -77,7 +77,6 @@ async function readSession(file: string): Promise<{ header: string; metas: Meta[
       id: entry.id,
       parentId: entry.parentId ?? null,
       type: entry.type,
-      timestamp: entry.timestamp,
       firstKeptEntryId: entry.firstKeptEntryId,
       targetId: entry.targetId,
       label: entry.label,
@@ -103,20 +102,29 @@ const findLast = (metas: readonly Meta[], match: (meta: Meta) => boolean): Meta 
   return undefined;
 };
 
+// sessionEntryToContextMessages: only these entry types become a message. The others
+// (session_info, model_change, thinking_level_change, label, custom) are state or
+// display entries, so moving or dropping them cannot change what pi replays.
+const PROJECTED_TYPES = new Set(["message", "custom_message", "branch_summary", "compaction"]);
+
 // getBranch: pi restores the leaf as the last entry in file order.
-function branchOf(metas: readonly Meta[]): Meta[] {
+function branchOf(metas: readonly Meta[]): Meta[] | undefined {
   const byId = new Map(metas.map((meta) => [meta.id, meta]));
+  const seen = new Set<string>();
   const path: Meta[] = [];
-  let current = metas[metas.length - 1];
+  // A dangling parentId ends the branch, exactly as pi's own walk does; a cycle would
+  // hang that walk, so treat it as a corrupt file instead of trimming it.
+  let current: Meta | undefined = metas[metas.length - 1];
   while (current) {
+    if (seen.has(current.id)) return undefined;
+    seen.add(current.id);
     path.push(current);
-    current = current.parentId ? byId.get(current.parentId)! : undefined!;
+    current = current.parentId ? byId.get(current.parentId) : undefined;
   }
   return path.reverse();
 }
 
 // buildContextEntries: the newest compaction, then its kept entries, then the rest.
-// Labels are excluded because they project to no message and are free to move.
 function contextIds(path: readonly Meta[]): string {
   const visible: Meta[] = [];
   const compaction = findLast(path, (meta) => meta.type === "compaction");
@@ -132,7 +140,7 @@ function contextIds(path: readonly Meta[]): string {
     visible.push(...path.slice(index + 1));
   }
   return visible
-    .filter((meta) => meta.type !== "label")
+    .filter((meta) => PROJECTED_TYPES.has(meta.type))
     .map((meta) => meta.id)
     .join(",");
 }
@@ -148,27 +156,29 @@ function settingsOf(path: readonly Meta[]): string {
   return `${thinking}|${model}`;
 }
 
-// getSessionName: the last session_info in file order, branch or not.
-const nameOf = (metas: readonly Meta[]): string | undefined =>
-  findLast(metas, (meta) => meta.type === "session_info")?.name;
+// State pi resolves by walking the branch: the last writer wins.
+const BRANCH_STATE = [(meta: Meta) => meta.thinking !== undefined, (meta: Meta) => meta.model !== undefined];
 
-// _buildIndex: labels are global state replayed over the whole file, last write wins.
-// A label dies with its target, so callers pass the ids that survive the trim.
-function labelsOn(metas: readonly Meta[], targets: ReadonlySet<string>): Meta[] {
-  const byTarget = new Map<string, Meta>();
+// State pi resolves by replaying the whole file, abandoned branches included:
+// getSessionName takes the last session_info, getLabel the last write per target.
+function fileStateWinners(metas: readonly Meta[]): Map<string, Meta> {
+  const winners = new Map<string, Meta>();
   for (const meta of metas) {
-    if (meta.type !== "label" || !meta.targetId) continue;
-    if (meta.label) byTarget.set(meta.targetId, meta);
-    else byTarget.delete(meta.targetId);
+    if (meta.type === "session_info") winners.set("name", meta);
+    else if (meta.type === "label" && meta.targetId) winners.set(`label:${meta.targetId}`, meta);
   }
-  return [...byTarget.values()].filter((meta) => targets.has(meta.targetId!));
+  return winners;
 }
 
-const labelSignature = (labels: readonly Meta[]): string =>
-  labels
-    .map((meta) => `${meta.targetId}=${meta.label}`)
+// The values those winners resolve to: an empty label clears the bookmark, and a label
+// dies with its target, so callers pass the ids that survive the trim.
+function fileStateOf(metas: readonly Meta[], targets: ReadonlySet<string>): string {
+  return [...fileStateWinners(metas)]
+    .filter(([key, meta]) => key === "name" || (meta.label && targets.has(meta.targetId!)))
+    .map(([key, meta]) => `${key}=${meta.name ?? meta.label}`)
     .sort()
     .join(",");
+}
 
 // Planning
 
@@ -182,83 +192,82 @@ function preservesProjections(
   return (
     contextIds(trimmed) === contextIds(path) &&
     settingsOf(trimmed) === settingsOf(path) &&
-    nameOf(trimmed) === nameOf(metas) &&
-    labelSignature(labelsOn(trimmed, survivors)) === labelSignature(labelsOn(metas, survivors))
+    fileStateOf(trimmed, survivors) === fileStateOf(metas, survivors)
   );
 }
 
 function planTrim(metas: readonly Meta[]): TrimPlan | undefined {
   const path = branchOf(metas);
+  if (!path) return undefined;
   const compactions = path.filter((meta) => meta.type === "compaction");
   if (compactions.length < KEEP_GENERATIONS) return undefined;
   const cut = compactions[compactions.length - KEEP_GENERATIONS];
   const cutIndex = path.findIndex((meta) => meta.id === cut.firstKeptEntryId);
   if (cutIndex < 0) return undefined;
 
+  // Everything from the cut on is kept verbatim. Only state pi replays has to be carried
+  // over, and only when the entry that currently wins falls outside that range: branch
+  // state goes in front of the cut so it stays on the path, file state goes last so it
+  // stays the final write. Neither placement is visible to the compaction's context.
   const kept = path.slice(cutIndex);
-  const dropped = path.slice(0, cutIndex);
-  // Settings are read off the branch, so rescue only what the kept range no longer states.
-  const rescued: Meta[] = [];
-  if (!kept.some((meta) => meta.thinking !== undefined)) {
-    const meta = findLast(dropped, (entry) => entry.thinking !== undefined);
-    if (meta) rescued.push(meta);
-  }
-  if (!kept.some((meta) => meta.model !== undefined)) {
-    const meta = findLast(dropped, (entry) => entry.model !== undefined);
-    if (meta) rescued.push(meta);
-  }
-  // Keeping exactly the file-order-last session_info reproduces getSessionName() no
-  // matter which branch named the session.
-  const name = findLast(metas, (meta) => meta.type === "session_info");
-  if (name && !kept.includes(name)) rescued.push(name);
-  rescued.sort((a, b) => a.index - b.index);
+  const inKept = new Set(kept.map((meta) => meta.id));
+  const outside = (meta: Meta | undefined): meta is Meta => meta !== undefined && !inKept.has(meta.id);
+  const byIndex = (a: Meta, b: Meta) => a.index - b.index;
+  const head = BRANCH_STATE.map((defines) => findLast(path, defines))
+    .filter(outside)
+    .sort(byIndex);
+  const tail = [...fileStateWinners(metas).values()].filter(outside).sort(byIndex);
 
-  // Labels stay where they are: a compaction may point at one, since findCutPoint()
-  // extends the cut backwards over entries that produce no message.
-  const core = [...rescued, ...kept].filter((meta) => meta.type !== "session_info" || meta === name);
-  const coreIds = new Set(core.map((meta) => meta.id));
-  // The leaf is never dropped: entries appended after the trim still point at it.
-  const leaf = path[path.length - 1];
-  const chain = core.filter((meta) => meta === leaf || meta.type !== "label" || coreIds.has(meta.targetId!));
-  const survivors = new Set(chain.map((meta) => meta.id));
-  // A surviving target whose winning label was dropped gets that label back at the tail.
-  const labels = labelsOn(metas, survivors).filter((meta) => !survivors.has(meta.id));
-
-  const trimmed = [...chain, ...labels];
+  const chain = [...head, ...kept];
+  const trimmed = [...chain, ...tail];
+  const survivors = new Set(trimmed.map((meta) => meta.id));
   if (!preservesProjections(trimmed, path, metas, survivors)) return undefined;
-  return { chain, labels, kept: trimmed.length, bytes: trimmed.reduce((total, meta) => total + meta.bytes, 0) };
+  return {
+    chain,
+    tail,
+    total: metas.length,
+    kept: trimmed.length,
+    bytes: trimmed.reduce((total, meta) => total + meta.bytes, 0),
+  };
 }
 
 // Writing
 
 // Re-chain survivors: ids never change, so entries appended later still link up.
-// Buffering is safe because the surviving range is what pi would replay anyway.
 async function writeTrimmed(file: string, header: string, plan: TrimPlan): Promise<void> {
   const keep = new Set(plan.chain.map((meta) => meta.index));
-  const lines: string[] = [header];
-  let parentId: string | null = null;
-  for await (const [, entry, index] of sessionLines(file)) {
-    if (!keep.has(index)) continue;
-    entry.parentId = parentId;
-    parentId = entry.id;
-    lines.push(JSON.stringify(entry));
-  }
-  for (const meta of plan.labels) {
-    lines.push(
-      JSON.stringify({
-        type: "label",
-        id: meta.id,
-        parentId,
-        timestamp: meta.timestamp,
-        targetId: meta.targetId,
-        label: meta.label,
-      }),
-    );
-    parentId = meta.id;
-  }
+  const holdBack = new Set(plan.tail.map((meta) => meta.index));
+  const held = new Map<number, Record<string, any>>();
   const temp = `${file}.trim`;
-  writeFileSync(temp, `${lines.join("\n")}\n`);
-  renameSync(temp, file);
+  try {
+    const fd = openSync(temp, "w");
+    let seen = 0;
+    let parentId: string | null = null;
+    const emit = (entry: Record<string, any>) => {
+      entry.parentId = parentId;
+      parentId = entry.id;
+      writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+    };
+    try {
+      writeFileSync(fd, `${header}\n`);
+      for await (const [, entry, index] of sessionLines(file)) {
+        if (index < 0) continue;
+        seen++;
+        if (keep.has(index)) emit(entry);
+        else if (holdBack.has(index)) held.set(index, entry);
+      }
+      for (const meta of plan.tail) emit(held.get(meta.index)!);
+    } finally {
+      closeSync(fd);
+    }
+    // The plan addresses entries by line, so anything appended since it was made would be
+    // dropped. Publish nothing and let the user re-run instead.
+    if (seen !== plan.total) throw new Error("the session grew while trimming, so nothing was rewritten");
+    renameSync(temp, file);
+  } catch (error) {
+    rmSync(temp, { force: true });
+    throw error;
+  }
 }
 
 // Command
@@ -281,7 +290,7 @@ async function analyze(file: string): Promise<Analysis | undefined> {
     header: session.header,
     plan,
     before: statSync(file).size,
-    after: plan.bytes + session.header.length + 1,
+    after: plan.bytes + Buffer.byteLength(session.header) + 1,
     entries: session.metas.length,
   };
 }
