@@ -1,6 +1,11 @@
+// npm-description: Prune stale tracked paths from Pi's compaction context.
+// npm-keywords: compaction, context, context-pruning, context-management, file-tracking, path-filtering
+
 /**
- * On compaction, keep a tracked path only if it's under pi's cwd and still exists
- * on disk -- drops temp files and anything since removed, no ignore rules to keep.
+ * Pi's tracked-file list only grows over a conversation, with no built-in cleanup for
+ * paths that later disappear or fall outside the current project. Long conversations
+ * can therefore spend substantial compaction context on stale paths. Keep only paths
+ * under the current cwd that still exist, without applying ignore rules.
  */
 
 import { access } from "node:fs/promises";

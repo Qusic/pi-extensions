@@ -1,6 +1,11 @@
-// Native pi provider for a copilot2api data-plane endpoint.
-// /login stores the API root and token; pi then refreshes and persists the live model
-// catalog automatically. Models use their native Messages, Responses, or Chat endpoint.
+// npm-description: Add copilot2api as a native Pi provider with live model discovery.
+// npm-keywords: copilot2api, github-copilot, copilot, provider, pi-provider, models, model-discovery, llm, ai-gateway, openai-compatible, anthropic-compatible
+
+/**
+ * Integrates with Pi's /login flow and credential store for the API root and token.
+ * Pi refreshes and persists the remote catalog automatically, while each model uses
+ * its native Messages, Responses, or Chat endpoint.
+ */
 
 import {
   type ApiKeyCredential,

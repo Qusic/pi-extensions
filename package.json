@@ -1,12 +1,16 @@
 {
-	"name": "pi-extensions",
-	"version": "1.0.0",
-	"type": "module",
-	"license": "MIT",
+	"name": "@qusic/pi-extensions",
+	"version": "0.0.0",
+	"homepage": "https://github.com/Qusic/pi-extensions#readme",
+	"bugs": {
+		"url": "https://github.com/Qusic/pi-extensions/issues"
+	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/Qusic/pi-extensions.git"
+		"url": "git+https://github.com/Qusic/pi-extensions.git"
 	},
+	"license": "MIT",
+	"type": "module",
 	"pi": {
 		"extensions": ["./*.ts"]
 	},

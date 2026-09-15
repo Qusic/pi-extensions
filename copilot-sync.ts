@@ -1,11 +1,17 @@
-// Sync tenant-specific GitHub Copilot capabilities from live CAPI /models.
-// Existing pi models get additive-only overrides: larger context/output limits and
-// missing xhigh/max tiers. Unknown tenant models are added in full. Re-run after a pi
-// upgrade so models newly built into pi move automatically from .models to overrides.
-// The tenant endpoint and client headers are pinned on the provider so custom models
-// inherit them. The baseUrl pin also works around compaction reading the catalog
-// baseUrl instead of the per-request one (earendil-works/pi#6768 — remove it once fixed).
-// Other providers and top-level models.json keys are preserved.
+// npm-description: Sync live GitHub Copilot model capabilities into Pi.
+// npm-keywords: github-copilot, copilot, models, model-discovery, model-catalog, context-window, reasoning, provider
+
+/**
+ * A Copilot tenant's live catalog can differ from Pi's built-in metadata. Existing
+ * models get additive-only overrides for larger context/output limits and missing
+ * xhigh/max tiers; unknown tenant models are added in full. Re-run after a Pi upgrade
+ * so newly built-in models move automatically from .models to overrides.
+ *
+ * The tenant endpoint and client headers are pinned on the provider so custom models
+ * inherit them. The baseUrl pin also works around compaction reading the catalog
+ * baseUrl instead of the per-request one (earendil-works/pi#6768 — remove it once fixed).
+ * Other providers and top-level models.json keys are preserved.
+ */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // pi's extension loader exposes pi-ai through compat; providers/all is not resolvable there.

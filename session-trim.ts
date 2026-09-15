@@ -1,10 +1,17 @@
-// Reclaim disk space from the current compacted pi session.
-// A compacted session keeps every superseded entry on disk even though pi only replays
-// the newest compaction summary plus the entries it kept. /session-trim drops entries
-// older than the Nth-from-last compaction on the active branch and every abandoned
-// branch, then re-opens the session so pi's in-memory entries match the file. The trim
-// is refused unless the projected context, the resolved model/thinking level, the
-// session name, and the surviving labels are provably unchanged.
+// npm-description: Speed up loading large Pi sessions by pruning superseded history.
+// npm-keywords: session, session-management, session-file, session-loading, compaction, performance, history-pruning, cleanup
+
+/**
+ * Pi reads and scans the entire JSONL file when loading a session, including history
+ * superseded by compaction and abandoned branches that are no longer replayed. Large,
+ * long-running sessions can therefore become progressively slower to open.
+ *
+ * /session-trim drops entries older than the Nth-from-last compaction on the active
+ * branch and every abandoned branch, then re-opens the session so Pi's in-memory entries
+ * match the file. The trim is refused unless the projected context, resolved model and
+ * thinking level, session name, and surviving labels are provably unchanged.
+ */
+
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { closeSync, createReadStream, openSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
