@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - shell: python
+        run: |
+          from datetime import datetime, timezone
+          import json
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tarfile
+          import tempfile
+          from urllib.request import urlretrieve
+
+          root = Path.cwd()
+          today = datetime.now(timezone.utc).strftime("%Y%m%d")
+          package_template = json.loads((root / "package.json").read_text())
+
+          def npm(*args):
+              return subprocess.check_output(["npm", *args], text=True).strip()
+
+          with tempfile.TemporaryDirectory() as temporary:
+              temporary = Path(temporary)
+
+              for source in sorted(root.glob("*.ts")):
+                  package = f"@qusic/pi-{source.stem}"
+                  info = json.loads(
+                      npm("show", package, "version", "dist.tarball", "--json")
+                  )
+                  latest = info["version"]
+                  archive = temporary / "latest.tgz"
+                  urlretrieve(info["dist.tarball"], archive)
+
+                  with tarfile.open(archive, "r:gz") as published:
+                      try:
+                          previous = published.extractfile(f"package/{source.name}").read()
+                      except KeyError:
+                          previous = None
+
+                  content = source.read_bytes()
+                  if previous == content:
+                      print(f"Skipping {package}@{latest}: {source.name} is unchanged")
+                      continue
+
+                  parts = latest.split(".")
+                  patch = int(parts[2]) + 1 if parts[:2] == ["0", today] else 0
+                  version = f"0.{today}.{patch}"
+                  metadata = content.decode().splitlines()
+                  description = metadata[0].removeprefix("// npm-description: ")
+                  keywords = metadata[1].removeprefix("// npm-keywords: ").split(", ")
+
+                  directory = temporary / source.stem
+                  directory.mkdir()
+                  shutil.copy(source, directory / source.name)
+                  shutil.copy(root / "README.md", directory / "README.md")
+
+                  manifest = package_template | {
+                      "name": package,
+                      "version": version,
+                      "description": description,
+                      "keywords": [
+                          "pi-package",
+                          "pi-extension",
+                          "pi",
+                          "pi-coding-agent",
+                          *keywords,
+                      ],
+                  }
+                  (directory / "package.json").write_text(
+                      json.dumps(manifest, indent="\t") + "\n"
+                  )
+
+                  print(f"Publishing {package}@{version}", flush=True)
+                  subprocess.run(["npm", "publish", directory], check=True)
