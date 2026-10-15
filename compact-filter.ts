@@ -1,35 +1,36 @@
-// npm-description: Prune stale tracked paths from Pi's compaction context.
-// npm-keywords: compaction, context, context-pruning, context-management, file-tracking, path-filtering
+// npm-description: Keep Pi compaction file lists scoped to the current summary window.
+// npm-keywords: compaction, context, context-pruning, context-management, file-tracking, file-operations
 
 /**
- * Pi's tracked-file list only grows over a conversation, with no built-in cleanup for
- * paths that later disappear or fall outside the current project. Long conversations
- * can therefore spend substantial compaction context on stale paths. Keep only paths
- * under the current cwd that still exist, without applying ignore rules.
+ * Pi carries file lists forward across compactions. Keep only paths from the
+ * messages being summarized now, including the prefix of a split turn.
  */
 
-import { access } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, FileOperations } from "@earendil-works/pi-coding-agent";
 
-async function keep(rawPath: string, cwd: string): Promise<boolean> {
-	const abs = resolve(cwd, rawPath);
-	const rel = relative(cwd, abs);
-	if (rel.startsWith("..") || isAbsolute(rel)) return false; // outside cwd
-	return access(abs).then(() => true, () => false); // exists on disk?
+// File tracking reference: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts
+function collectFileOps(message: AgentMessage, fileOps: FileOperations): void {
+	if (message.role !== "assistant" && message.role !== "toolResult") return;
+	const calls = message.role === "assistant"
+		? message.content.filter((block) => block?.type === "toolCall")
+		: message.nestedCalls?.calls ?? [];
+	for (const call of calls) {
+		const path = call.arguments?.path;
+		if (typeof path !== "string" || !path) continue;
+		if (call.name === "read") fileOps.read.add(path);
+		else if (call.name === "write") fileOps.written.add(path);
+		else if (call.name === "edit") fileOps.edited.add(path);
+	}
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_before_compact", async (event, ctx) => {
-		let dropped = 0;
-		for (const set of Object.values(event.preparation.fileOps)) {
-			for (const p of [...set]) {
-				if (!(await keep(p, ctx.cwd))) {
-					set.delete(p);
-					dropped++;
-				}
-			}
+	pi.on("session_before_compact", (event) => {
+		const { fileOps, messagesToSummarize, turnPrefixMessages } = event.preparation;
+		for (const set of Object.values(fileOps)) set.clear();
+
+		for (const message of [...messagesToSummarize, ...turnPrefixMessages]) {
+			collectFileOps(message, fileOps);
 		}
-		if (dropped) ctx.ui.notify(`Compaction: dropped ${dropped} path(s) outside cwd or missing on disk`, "info");
 	});
 }

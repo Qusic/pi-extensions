@@ -4,7 +4,7 @@ Small [Pi](https://github.com/earendil-works/pi) extensions for personal use, pu
 
 | Extension | npm | Install | Description |
 | --- | --- | --- | --- |
-| [compact-filter](./compact-filter.ts) | [![npm](https://img.shields.io/npm/v/%40qusic%2Fpi-compact-filter)](https://www.npmjs.com/package/@qusic/pi-compact-filter) | `pi install npm:@qusic/pi-compact-filter` | Prune stale tracked paths from Pi's compaction context. |
+| [compact-filter](./compact-filter.ts) | [![npm](https://img.shields.io/npm/v/%40qusic%2Fpi-compact-filter)](https://www.npmjs.com/package/@qusic/pi-compact-filter) | `pi install npm:@qusic/pi-compact-filter` | Keep Pi compaction file lists scoped to the current summary window. |
 | [copilot-sync](./copilot-sync.ts) | [![npm](https://img.shields.io/npm/v/%40qusic%2Fpi-copilot-sync)](https://www.npmjs.com/package/@qusic/pi-copilot-sync) | `pi install npm:@qusic/pi-copilot-sync` | Sync live GitHub Copilot model capabilities into Pi. |
 | [copilot2api](./copilot2api.ts) | [![npm](https://img.shields.io/npm/v/%40qusic%2Fpi-copilot2api)](https://www.npmjs.com/package/@qusic/pi-copilot2api) | `pi install npm:@qusic/pi-copilot2api` | Add copilot2api as a native Pi provider with live model discovery. |
 | [dynamic-mcp](./dynamic-mcp.ts) | [![npm](https://img.shields.io/npm/v/%40qusic%2Fpi-dynamic-mcp)](https://www.npmjs.com/package/@qusic/pi-dynamic-mcp) | `pi install npm:@qusic/pi-dynamic-mcp` | Dynamically manage MCP servers for the current Pi session. |
