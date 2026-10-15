@@ -74,6 +74,7 @@ jobs:
                   directory.mkdir()
                   shutil.copy(source, directory / source.name)
                   shutil.copy(root / "README.md", directory / "README.md")
+                  shutil.copy(root / "LICENSE", directory / "LICENSE")
 
                   manifest = package_template | {
                       "name": package,
