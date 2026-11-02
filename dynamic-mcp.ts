@@ -2,8 +2,9 @@
 // npm-keywords: mcp, model-context-protocol, dynamic-mcp, session-scoped, stdio, streamable-http
 
 import { isDeepStrictEqual } from "node:util";
-import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, McpServerConfig } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 
 // Pi's McpServerConfig and validator: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/mcp-servers.ts
 // This model-facing subset is validated again by registerMcpServer.
