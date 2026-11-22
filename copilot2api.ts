@@ -144,21 +144,28 @@ function thinkingLevelMapOf(live: LiveModel, api: SupportedApi, inherited?: Thin
   return map;
 }
 
+// Strict flags as in pi's github-copilot catalog. Copilot's /responses treats tools without `strict` as strict.
+function compatOf(live: LiveModel, api: SupportedApi): Model<SupportedApi>["compat"] {
+  const supports = live.capabilities?.supports;
+  switch (api) {
+    case "anthropic-messages":
+      return { supportsStrictTools: true, ...(supports?.adaptive_thinking && { forceAdaptiveThinking: true }) };
+    case "openai-responses":
+      return { supportsStrictMode: true };
+    case "openai-completions":
+      return {
+        supportsStrictMode: true,
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: Boolean(supports?.reasoning_effort?.length),
+      };
+  }
+}
+
 function toModel(live: LiveModel, apiRoot: string): Model<SupportedApi> {
   const inherited = COPILOT_MODELS.get(live.id);
   const api = resolveApi(live);
   const supports = live.capabilities?.supports;
-  let compat: Model<SupportedApi>["compat"] = inherited?.api === api ? inherited.compat : undefined;
-  if (api === "openai-completions") {
-    compat = {
-      ...compat,
-      supportsStore: false,
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: Boolean(supports?.reasoning_effort?.length),
-    };
-  } else if (api === "anthropic-messages" && supports?.adaptive_thinking) {
-    compat = { ...compat, forceAdaptiveThinking: true };
-  }
   return {
     id: live.id,
     name: live.name ?? inherited?.name ?? live.id,
@@ -171,7 +178,7 @@ function toModel(live: LiveModel, apiRoot: string): Model<SupportedApi> {
     cost: inherited?.cost ?? ZERO_COST,
     contextWindow: contextWindowOf(live),
     maxTokens: live.capabilities?.limits?.max_output_tokens ?? inherited?.maxTokens ?? 16384,
-    compat,
+    compat: { ...(inherited?.api === api ? inherited.compat : undefined), ...compatOf(live, api) },
   };
 }
 

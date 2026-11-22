@@ -8,9 +8,7 @@
  * so newly built-in models move automatically from .models to overrides.
  *
  * The tenant endpoint and client headers are pinned on the provider so custom models
- * inherit them. The baseUrl pin also works around compaction reading the catalog
- * baseUrl instead of the per-request one (earendil-works/pi#6768 — remove it once fixed).
- * Other providers and top-level models.json keys are preserved.
+ * inherit them. Other providers and top-level models.json keys are preserved.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -118,15 +116,14 @@ function isReasoning(model: LiveModel): boolean {
   );
 }
 
-function reasoningEfforts(model: LiveModel, api: string): Set<string> | undefined {
-  if (api === "openai-completions") return undefined;
+function reasoningEfforts(model: LiveModel): Set<string> | undefined {
   const efforts = model.capabilities?.supports?.reasoning_effort;
   return efforts?.length ? new Set(efforts) : undefined;
 }
 
 // Existing models only need explicit opt-in for pi's optional top tiers.
-function deriveOverrideThinkingMap(model: LiveModel, api: string, builtinMap?: ThinkingMap): ThinkingMap | undefined {
-  const offered = reasoningEfforts(model, api);
+function deriveOverrideThinkingMap(model: LiveModel, builtinMap?: ThinkingMap): ThinkingMap | undefined {
+  const offered = reasoningEfforts(model);
   if (!offered) return undefined;
   const additions: ThinkingMap = {};
   for (const level of OPTIONAL_TIERS) {
@@ -137,13 +134,32 @@ function deriveOverrideThinkingMap(model: LiveModel, api: string, builtinMap?: T
 
 // Unknown models need a complete map because they have no built-in defaults.
 function deriveCustomThinkingMap(model: LiveModel, api: string): ThinkingMap | undefined {
-  const offered = reasoningEfforts(model, api);
+  const offered = reasoningEfforts(model);
   if (!offered) return undefined;
   const map: ThinkingMap = {};
   if (api === "openai-responses") map.off = offered.has("none") ? "none" : offered.has("off") ? "off" : null;
   map.minimal = offered.has("minimal") ? "minimal" : (TIERS.find((level) => offered.has(level)) ?? null);
   for (const level of TIERS) map[level] = offered.has(level) ? level : null;
   return map;
+}
+
+// Strict flags as in pi's github-copilot catalog. Copilot's /responses treats tools without `strict` as strict.
+function deriveCustomCompat(model: LiveModel, api: string): Record<string, boolean> | undefined {
+  const supports = model.capabilities?.supports;
+  switch (api) {
+    case "anthropic-messages":
+      return { supportsStrictTools: true, ...(supports?.adaptive_thinking && { forceAdaptiveThinking: true }) };
+    case "openai-responses":
+      return { supportsStrictMode: true };
+    case "openai-completions":
+      // Copilot rejects `store` and the developer role.
+      return {
+        supportsStrictMode: true,
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: Boolean(supports?.reasoning_effort?.length),
+      };
+  }
 }
 
 // Sync plan construction
@@ -154,14 +170,14 @@ function buildModelOverride(model: LiveModel, builtin: BuiltinModel): ModelOverr
   const maxTokens = model.capabilities?.limits?.max_output_tokens;
   if (contextWindow !== undefined && contextWindow > builtin.contextWindow) override.contextWindow = contextWindow;
   if (maxTokens !== undefined && maxTokens > builtin.maxTokens) override.maxTokens = maxTokens;
-  const thinkingLevelMap = deriveOverrideThinkingMap(model, builtin.api, builtin.thinkingLevelMap);
+  const thinkingLevelMap = deriveOverrideThinkingMap(model, builtin.thinkingLevelMap);
   if (thinkingLevelMap) override.thinkingLevelMap = thinkingLevelMap;
   return Object.keys(override).length ? override : undefined;
 }
 
 function buildCustomModel(model: LiveModel, api: string): CustomModel {
   const supports = model.capabilities?.supports;
-  const customModel: CustomModel = {
+  return {
     id: model.id,
     name: model.name ?? model.id,
     api,
@@ -169,16 +185,9 @@ function buildCustomModel(model: LiveModel, api: string): CustomModel {
     input: supports?.vision ? ["text", "image"] : ["text"],
     contextWindow: contextWindowOf(model.capabilities) ?? 128000,
     maxTokens: model.capabilities?.limits?.max_output_tokens ?? 4096,
+    compat: deriveCustomCompat(model, api),
+    thinkingLevelMap: deriveCustomThinkingMap(model, api),
   };
-  if (api === "openai-completions") {
-    // Copilot rejects these OpenAI-compatible extensions.
-    customModel.compat = { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false };
-  } else if (api === "anthropic-messages" && supports?.adaptive_thinking) {
-    customModel.compat = { forceAdaptiveThinking: true };
-  }
-  const thinkingLevelMap = deriveCustomThinkingMap(model, api);
-  if (thinkingLevelMap) customModel.thinkingLevelMap = thinkingLevelMap;
-  return customModel;
 }
 
 function isSelectableChat(model: LiveModel): boolean {
