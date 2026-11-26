@@ -12,7 +12,6 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-// pi's extension loader exposes pi-ai through compat; providers/all is not resolvable there.
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
